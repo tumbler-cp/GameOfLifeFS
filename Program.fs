@@ -1,122 +1,88 @@
 ﻿open Gtk
 
-Application.Init()
+type Cell = int * int
 
-let width, height = 50, 50
-let cellSize = 16
+let neighbors (x, y) =
+    [ for dx in -1 .. 1 do
+          for dy in -1 .. 1 do
+              if dx <> 0 || dy <> 0 then yield x + dx, y + dy ]
 
-let initializeGrid () = Array.init width (fun _ -> Array.create height false)
-let grid = ref (initializeGrid ())
-let running = ref false
+let nextGeneration (board: Set<Cell>) : Set<Cell> =
+    let aliveNeighbors cell =
+        neighbors cell
+        |> List.filter (fun n -> board.Contains n)
+        |> List.length
+    let candidates =
+        board |> Set.fold (fun acc cell ->
+            Set.union acc (neighbors cell |> Set.ofList)
+        ) board
+    candidates |> Set.filter (fun cell ->
+        if board.Contains cell then
+            let n = aliveNeighbors cell
+            n = 2 || n = 3
+        else
+            aliveNeighbors cell = 3
+    )
 
-let win = new Window "Game of Life"
-win.SetDefaultSize(width * cellSize, height * cellSize)
-win.SetPosition WindowPosition.Center
-win.Destroyed.Add(fun _ -> Application.Quit())
+let cellSize = 10
 
-let drawingArea = new DrawingArea()
-win.Add drawingArea
+type Msg =
+    | Tick
+    | GetState of AsyncReplyChannel<Set<Cell>>
 
-drawingArea.Drawn.Add(fun e ->
-    let cr = e.Cr
+[<EntryPoint>]
+let main argv =
+    Application.Init()
+    let window = new Window "Game of Life"   
+    window.SetDefaultSize(800, 600)
+    window.SetPosition WindowPosition.Center
+    window.DeleteEvent.Add(fun _ -> Application.Quit(); ())
 
-    cr.SetSourceRGB(0.0, 0.0, 0.0) 
-    cr.Paint()
+    let drawingArea = new DrawingArea()
+    window.Add drawingArea
 
-    for x in 0 .. width - 1 do
-        for y in 0 .. height - 1 do
-            match (!grid).[x].[y] with
-            | true -> cr.SetSourceRGB(1.0, 1.0, 1.0)
-            | false -> cr.SetSourceRGB(0.0, 0.0, 0.0)
+    let initialBoard = Set.ofList [ 1, 0; 2, 1; 0, 2; 1, 2; 2, 2 ]
 
-            cr.Rectangle(float (x * cellSize), float (y * cellSize), float cellSize, float cellSize)
+    let boardAgent =
+        MailboxProcessor.Start(fun inbox ->
+            let rec loop (board: Set<Cell>) =
+                async {
+                    let! msg = inbox.Receive()
+                    match msg with
+                    | Tick ->
+                        let newBoard = nextGeneration board
+                        GLib.Idle.Add(fun () -> drawingArea.QueueDraw(); false) |> ignore
+                        return! loop newBoard
+                    | GetState reply ->
+                        reply.Reply board
+                        return! loop board
+                }
+            loop initialBoard
+        )
+    
+    drawingArea.Drawn.Add(fun args ->
+        let cr = args.Cr
+        cr.SetSourceRGB(1.0, 1.0, 1.0)
+        cr.Paint()
+        cr.SetSourceRGB(0.0, 0.0, 0.0)
+        
+        let board = boardAgent.PostAndReply(fun reply -> GetState reply)
+        let offsetX, offsetY = 50, 50
+        board |> Set.iter (fun (x, y) ->
+            let x' = float (x * cellSize + offsetX)
+            let y' = float (y * cellSize + offsetY)
+            let size = float cellSize
+            cr.Rectangle(x', y', size, size)
             cr.Fill()
-
-    cr.SetSourceRGB(0.2, 0.2, 0.2)
-    for x in 0 .. width do
-        cr.MoveTo(float (x * cellSize), 0.0)
-        cr.LineTo(float (x * cellSize), float (height * cellSize))
-    for y in 0 .. height do
-        cr.MoveTo(0.0, float (y * cellSize))
-        cr.LineTo(float (width * cellSize), float (y * cellSize))
-    cr.Stroke()
-)
-
-drawingArea.AddEvents(int Gdk.EventMask.ButtonPressMask)
-drawingArea.ButtonPressEvent.Add(fun args ->
-    let x, y = int (args.Event.X / float cellSize), int (args.Event.Y / float cellSize)
-    grid := Array.mapi (fun i row -> 
-        if i = x then 
-            Array.mapi (fun j cell -> if j = y then not cell else cell) row 
-        else row) !grid
-    drawingArea.QueueDraw()
-)
-
-let countNeighbors (grid: bool[][]) x y =
-    let offsets = [ -1, -1; -1, 0; -1, 1; 0, -1; 0, 1; 1, -1; 1, 0; 1, 1 ]
-    offsets |> List.sumBy (fun (dx, dy) ->
-        let nx, ny = x + dx, y + dy
-        match nx, ny with
-        | nx, ny when nx >= 0 && ny >= 0 && nx < width && ny < height && grid.[nx].[ny] -> 1
-        | _ -> 0
-    )
-
-let updateGrid (grid: bool[][]) =
-    [| for x in 0 .. width - 1 ->
-        [| for y in 0 .. height - 1 ->
-            let neighbors = countNeighbors grid x y
-            match grid.[x].[y], neighbors with
-            | true, 2 | _, 3 -> true
-            | _ -> false |] |]
-
-let timeout () =
-    if !running then
-        grid := updateGrid !grid
-        drawingArea.QueueDraw()
-    true
-
-type Cell = Alive | Dead
-
-let parseGrid (input: string) =
-    let lines = input.Split('\n')
-    Array.init width (fun x ->
-        Array.init height (fun y ->
-            match lines.[y].[x] with
-            | 'O' -> Alive
-            | '.' -> Dead
-            | _ -> failwith "Invalid character in input"
         )
+        ()
     )
 
-let serializeGrid (grid: Cell[][]) =
-    grid
-    |> Array.map (fun row ->
-        row
-        |> Array.map (function
-            | Alive -> 'O'
-            | Dead -> '.'
-        )
-        |> System.String
-    )
-    |> String.concat "\n"
+    let _ = GLib.Timeout.Add(100u, fun () ->
+        boardAgent.Post Tick
+        true
+    ) 
 
-let loadGridFromFile (path: string) =
-    let input = System.IO.File.ReadAllText(path)
-    parseGrid input
-
-let saveGridToFile (path: string) (grid: Cell[][]) =
-    let output = serializeGrid grid
-    System.IO.File.WriteAllText(path, output)
-
-GLib.Timeout.Add(100u, timeout) |> ignore
-
-win.KeyPressEvent.Add(fun args ->
-    match args.Event.Key with
-    | Gdk.Key.space -> running := not !running
-    | Gdk.Key.Escape -> Application.Quit()
-    | _ -> ()
-)
-
-win.ShowAll()
-Application.Run()
-
+    window.ShowAll()
+    Application.Run()
+    0
